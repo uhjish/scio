@@ -198,6 +198,8 @@ lazy val root: Project = Project(
   scioTest,
   scioBigQuery,
   scioBigtable,
+  scioCassandra2,
+  scioCassandra3,
   scioElasticsearch,
   scioExtra,
   scioJdbc,
@@ -293,6 +295,40 @@ lazy val scioBigtable: Project = Project(
   scioCore,
   scioTest % "it"
 ).configs(IntegrationTest)
+
+lazy val scioCassandra2: Project = Project(
+  "scio-cassandra2",
+  file("scio-cassandra2")
+).settings(
+  commonSettings,
+  description := "Scio add-on for Apache Cassandra 2.x",
+  scalaSource in Compile := (baseDirectory in ThisBuild).value / "scio-cassandra3/src/main/scala",
+  scalaSource in Test := (baseDirectory in ThisBuild).value / "scio-cassandra3/src/test/scala",
+  libraryDependencies ++= Seq(
+    "com.datastax.cassandra" % "cassandra-driver-core" % "2.1.10.3",
+    "org.apache.cassandra" % "cassandra-all" % "2.0.17",
+    "org.apache.hadoop" % "hadoop-client" % hadoopVersion
+  )
+).dependsOn(
+  scioCore,
+  scioTest % "test"
+)
+
+lazy val scioCassandra3: Project = Project(
+  "scio-cassandra3",
+  file("scio-cassandra3")
+).settings(
+  commonSettings,
+  description := "Scio add-on for Apache Cassandra 3.x",
+  libraryDependencies ++= Seq(
+    "com.datastax.cassandra" % "cassandra-driver-core" % "3.2.0",
+    "org.apache.cassandra" % "cassandra-all" % "3.11.0" exclude ("org.slf4j", "log4j-over-slf4j"),
+    "org.apache.hadoop" % "hadoop-client" % hadoopVersion
+  )
+).dependsOn(
+  scioCore,
+  scioTest % "test"
+)
 
 lazy val scioElasticsearch: Project = Project(
   "scio-elasticsearch",
