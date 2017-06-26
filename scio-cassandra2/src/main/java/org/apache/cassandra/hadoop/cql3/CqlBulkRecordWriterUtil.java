@@ -17,6 +17,7 @@
 
 package org.apache.cassandra.hadoop.cql3;
 
+import org.apache.cassandra.config.Config;
 import org.apache.cassandra.hadoop.ConfigHelper;
 import org.apache.hadoop.conf.Configuration;
 
@@ -45,8 +46,8 @@ public class CqlBulkRecordWriterUtil {
     ConfigHelper.setOutputKeyspace(conf, keyspace);
     ConfigHelper.setOutputColumnFamily(conf, table);
     ConfigHelper.setOutputPartitioner(conf, partitioner);
-    CqlBulkOutputFormat.setColumnFamilySchema(conf, table, tableSchema);
-    CqlBulkOutputFormat.setColumnFamilyInsertStatement(conf, table, insertStatement);
+    CqlBulkOutputFormat.setTableSchema(conf, table, tableSchema);
+    CqlBulkOutputFormat.setTableInsertStatement(conf, table, insertStatement);
 
     // workaround for Hadoop static initialization
     if (!System.getProperties().containsKey("hadoop.home.dir") &&
@@ -54,6 +55,7 @@ public class CqlBulkRecordWriterUtil {
       System.setProperty("hadoop.home.dir", "/");
     }
 
+    Config.setClientMode(true);
     return new CqlBulkRecordWriter(conf);
   }
 }

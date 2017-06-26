@@ -15,19 +15,8 @@
  */
 package com.datastax.driver.core;
 
-import com.datastax.driver.core.exceptions.AuthenticationException;
-import com.datastax.driver.core.utils.MoreFutures;
-import com.google.common.annotations.VisibleForTesting;
-import com.google.common.base.Throwables;
-import com.google.common.collect.Lists;
-import com.google.common.util.concurrent.*;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
-import javax.annotation.Nullable;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.ListIterator;
 import java.util.Set;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -36,9 +25,21 @@ import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 
-import static com.datastax.driver.core.Connection.State.*;
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.collect.Lists;
+import com.google.common.util.concurrent.*;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-class HostConnectionPool implements Connection.Owner {
+import com.datastax.driver.core.exceptions.AuthenticationException;
+import com.datastax.driver.core.utils.MoreFutures;
+
+import static com.datastax.driver.core.Connection.State.GONE;
+import static com.datastax.driver.core.Connection.State.OPEN;
+import static com.datastax.driver.core.Connection.State.RESURRECTING;
+import static com.datastax.driver.core.Connection.State.TRASHED;
+
+class HostConnectionPool {
 
     private static final Logger logger = LoggerFactory.getLogger(HostConnectionPool.class);
 
@@ -50,13 +51,9 @@ class HostConnectionPool implements Connection.Owner {
 
     final List<Connection> connections;
     private final AtomicInteger open;
-    /**
-     * The total number of in-flight requests on all connections of this pool.
-     */
+    /** The total number of in-flight requests on all connections of this pool. */
     final AtomicInteger totalInFlight = new AtomicInteger();
-    /**
-     * The maximum value of {@link #totalInFlight} since the last call to {@link #cleanupIdleConnections(long)}
-     */
+    /** The maximum value of {@link #totalInFlight} since the last call to {@link #cleanupIdleConnections(long)}*/
     private final AtomicInteger maxTotalInFlight = new AtomicInteger();
     @VisibleForTesting
     final Set<Connection> trash = new CopyOnWriteArraySet<Connection>();
@@ -106,27 +103,27 @@ class HostConnectionPool implements Connection.Owner {
      *                         pool.
      */
     ListenableFuture<Void> initAsync(Connection reusedConnection) {
-        Executor initExecutor = manager.cluster.manager.configuration.getPoolingOptions().getInitializationExecutor();
-
         // Create initial core connections
-        final int coreSize = options().getCoreConnectionsPerHost(hostDistance);
-        final List<Connection> connections = Lists.newArrayListWithCapacity(coreSize);
-        final List<ListenableFuture<Void>> connectionFutures = Lists.newArrayListWithCapacity(coreSize);
-
-        int toCreate = coreSize;
-
-        if (reusedConnection != null && reusedConnection.setOwner(this)) {
-            toCreate -= 1;
-            connections.add(reusedConnection);
-            connectionFutures.add(MoreFutures.VOID_SUCCESS);
+        int capacity = options().getCoreConnectionsPerHost(hostDistance);
+        final List<Connection> connections = Lists.newArrayListWithCapacity(capacity);
+        final List<ListenableFuture<Void>> connectionFutures = Lists.newArrayListWithCapacity(capacity);
+        for (int i = 0; i < capacity; i++) {
+            Connection connection;
+            ListenableFuture<Void> connectionFuture;
+            // reuse the existing connection only once
+            if (reusedConnection != null && reusedConnection.setPool(this)) {
+                connection = reusedConnection;
+                connectionFuture = MoreFutures.VOID_SUCCESS;
+            } else {
+                connection = manager.connectionFactory().newConnection(this);
+                connectionFuture = connection.initAsync();
+            }
+            reusedConnection = null;
+            connections.add(connection);
+            connectionFutures.add(connectionFuture);
         }
 
-        List<Connection> newConnections = manager.connectionFactory().newConnections(this, toCreate);
-        connections.addAll(newConnections);
-        for (Connection connection : newConnections) {
-            ListenableFuture<Void> connectionFuture = connection.initAsync();
-            connectionFutures.add(handleErrors(connectionFuture, initExecutor));
-        }
+        Executor initExecutor = manager.cluster.manager.configuration.getPoolingOptions().getInitializationExecutor();
 
         ListenableFuture<List<Void>> allConnectionsFuture = Futures.allAsList(connectionFutures);
 
@@ -134,23 +131,14 @@ class HostConnectionPool implements Connection.Owner {
         Futures.addCallback(allConnectionsFuture, new FutureCallback<List<Void>>() {
             @Override
             public void onSuccess(List<Void> l) {
-                // Some of the connections might have failed, keep only the successful ones
-                ListIterator<Connection> it = connections.listIterator();
-                while (it.hasNext()) {
-                    if (it.next().isClosed())
-                        it.remove();
-                }
-
                 HostConnectionPool.this.connections.addAll(connections);
-                open.set(connections.size());
-
+                open.set(l.size());
                 if (isClosed()) {
                     initFuture.setException(new ConnectionException(host.getSocketAddress(), "Pool was closed during initialization"));
                     // we're not sure if closeAsync() saw the connections, so ensure they get closed
                     forceClose(connections);
                 } else {
-                    logger.debug("Created connection pool to host {} ({} connections needed, {} successfully opened)",
-                            host, coreSize, connections.size());
+                    logger.trace("Created connection pool to host {}", host);
                     phase.compareAndSet(Phase.INITIALIZING, Phase.READY);
                     initFuture.set(null);
                 }
@@ -166,25 +154,7 @@ class HostConnectionPool implements Connection.Owner {
         return initFuture;
     }
 
-    private ListenableFuture<Void> handleErrors(ListenableFuture<Void> connectionInitFuture, Executor executor) {
-        return Futures.catchingAsync(connectionInitFuture, Throwable.class, new AsyncFunction<Throwable, Void>() {
-            @Override
-            public ListenableFuture<Void> apply(@Nullable Throwable t) throws Exception {
-                // Propagate these exceptions because they mean no connection will ever succeed. They will be handled
-                // accordingly in SessionManager#maybeAddPool.
-                Throwables.propagateIfInstanceOf(t, ClusterNameMismatchException.class);
-                Throwables.propagateIfInstanceOf(t, UnsupportedProtocolVersionException.class);
-
-                // We don't want to swallow Errors either as they probably indicate a more serious issue (OOME...)
-                Throwables.propagateIfInstanceOf(t, Error.class);
-
-                // Otherwise, return success. The pool will simply ignore this connection when it sees that it's been closed.
-                return MoreFutures.VOID_SUCCESS;
-            }
-        }, executor);
-    }
-
-    // Clean up if we got a fatal error at construction time but still created part of the core connections
+    // Clean up if we got an error at construction time but still created part of the core connections
     private void forceClose(List<Connection> connections) {
         for (Connection connection : connections) {
             connection.closeAsync().force();
@@ -203,25 +173,16 @@ class HostConnectionPool implements Connection.Owner {
             throw new ConnectionException(host.getSocketAddress(), "Pool is " + phase);
 
         if (connections.isEmpty()) {
-            if (!host.convictionPolicy.canReconnectNow())
-                throw new TimeoutException("Connection pool is empty, currently trying to reestablish connections");
-            else {
-                int coreSize = options().getCoreConnectionsPerHost(hostDistance);
-                if (coreSize == 0) {
-                    maybeSpawnNewConnection();
-                } else {
-                    for (int i = 0; i < coreSize; i++) {
-                        // We don't respect MAX_SIMULTANEOUS_CREATION here because it's  only to
-                        // protect against creating connection in excess of core too quickly
-                        scheduledForCreation.incrementAndGet();
-                        manager.blockingExecutor().submit(newConnectionTask);
-                    }
-                }
-                Connection c = waitForConnection(timeout, unit);
-                totalInFlight.incrementAndGet();
-                c.setKeyspace(manager.poolsState.keyspace);
-                return c;
+            for (int i = 0; i < options().getCoreConnectionsPerHost(hostDistance); i++) {
+                // We don't respect MAX_SIMULTANEOUS_CREATION here because it's  only to
+                // protect against creating connection in excess of core too quickly
+                scheduledForCreation.incrementAndGet();
+                manager.blockingExecutor().submit(newConnectionTask);
             }
+            Connection c = waitForConnection(timeout, unit);
+            totalInFlight.incrementAndGet();
+            c.setKeyspace(manager.poolsState.keyspace);
+            return c;
         }
 
         int minInFlight = Integer.MAX_VALUE;
@@ -265,12 +226,10 @@ class HostConnectionPool implements Connection.Owner {
         }
 
         int connectionCount = open.get() + scheduledForCreation.get();
-        if (connectionCount < options().getCoreConnectionsPerHost(hostDistance)) {
-            maybeSpawnNewConnection();
-        } else if (connectionCount < options().getMaxConnectionsPerHost(hostDistance)) {
+        if (connectionCount < options().getMaxConnectionsPerHost(hostDistance)) {
             // Add a connection if we fill the first n-1 connections and almost fill the last one
             int currentCapacity = (connectionCount - 1) * options().getMaxRequestsPerConnection(hostDistance)
-                    + options().getNewConnectionThreshold(hostDistance);
+                + options().getNewConnectionThreshold(hostDistance);
             if (totalInFlightCount > currentCapacity)
                 maybeSpawnNewConnection();
         }
@@ -318,7 +277,7 @@ class HostConnectionPool implements Connection.Owner {
 
     private Connection waitForConnection(long timeout, TimeUnit unit) throws ConnectionException, TimeoutException {
         if (timeout == 0)
-            throw new TimeoutException("All connections are busy and pool timeout is 0");
+            throw new TimeoutException();
 
         long start = System.nanoTime();
         long remaining = timeout;
@@ -361,7 +320,7 @@ class HostConnectionPool implements Connection.Owner {
             remaining = timeout - Cluster.timeSince(start, unit);
         } while (remaining > 0);
 
-        throw new TimeoutException("All connections are busy");
+        throw new TimeoutException();
     }
 
     public void returnConnection(Connection connection) {
@@ -446,10 +405,6 @@ class HostConnectionPool implements Connection.Owner {
         try {
             Connection newConnection = tryResurrectFromTrash();
             if (newConnection == null) {
-                if (!host.convictionPolicy.canReconnectNow()) {
-                    open.decrementAndGet();
-                    return false;
-                }
                 logger.debug("Creating new connection on busy pool to {}", host);
                 newConnection = manager.connectionFactory().open(this);
             }
@@ -514,9 +469,6 @@ class HostConnectionPool implements Connection.Owner {
     }
 
     private void maybeSpawnNewConnection() {
-        if (isClosed() || !host.convictionPolicy.canReconnectNow())
-            return;
-
         while (true) {
             int inCreation = scheduledForCreation.get();
             if (inCreation >= MAX_SIMULTANEOUS_CREATION)
@@ -528,15 +480,16 @@ class HostConnectionPool implements Connection.Owner {
         manager.blockingExecutor().submit(newConnectionTask);
     }
 
-    @Override
-    public void onConnectionDefunct(final Connection connection) {
+    void replaceDefunctConnection(final Connection connection) {
         if (connection.state.compareAndSet(OPEN, GONE))
             open.decrementAndGet();
-        connections.remove(connection);
-
-        // Don't try to replace the connection now. Connection.defunct already signaled the failure,
-        // and either the host will be marked DOWN (which destroys all pools), or we want to prevent
-        // new connections for some time
+        if (connections.remove(connection))
+            manager.blockingExecutor().submit(new Runnable() {
+                @Override
+                public void run() {
+                    addConnectionIfUnderMaximum();
+                }
+            });
     }
 
     void cleanupIdleConnections(long now) {
@@ -547,9 +500,7 @@ class HostConnectionPool implements Connection.Owner {
         cleanupTrash(now);
     }
 
-    /**
-     * If we have more active connections than needed, trash some of them
-     */
+    /** If we have more active connections than needed, trash some of them */
     private void shrinkIfBelowCapacity() {
         int currentLoad = maxTotalInFlight.getAndSet(totalInFlight.get());
 
@@ -562,7 +513,7 @@ class HostConnectionPool implements Connection.Owner {
         int toTrash = Math.max(0, actual - needed);
 
         logger.trace("Current inFlight = {}, {} connections needed, {} connections available, trashing {}",
-                currentLoad, needed, actual, toTrash);
+            currentLoad, needed, actual, toTrash);
 
         if (toTrash <= 0)
             return;
@@ -575,9 +526,7 @@ class HostConnectionPool implements Connection.Owner {
             }
     }
 
-    /**
-     * Close connections that have been sitting in the trash for too long
-     */
+    /** Close connections that have been sitting in the trash for too long */
     private void cleanupTrash(long now) {
         for (Connection connection : trash) {
             if (connection.maxIdleTime < now && connection.state.compareAndSet(TRASHED, GONE)) {
@@ -617,8 +566,8 @@ class HostConnectionPool implements Connection.Owner {
         future = new CloseFuture.Forwarding(discardAvailableConnections());
 
         return closeFuture.compareAndSet(null, future)
-                ? future
-                : closeFuture.get(); // We raced, it's ok, return the future that was actually set
+            ? future
+            : closeFuture.get(); // We raced, it's ok, return the future that was actually set
     }
 
     public int opened() {
@@ -638,7 +587,6 @@ class HostConnectionPool implements Connection.Owner {
         for (final Connection connection : connections) {
             CloseFuture future = connection.closeAsync();
             future.addListener(new Runnable() {
-                @Override
                 public void run() {
                     if (connection.state.compareAndSet(OPEN, GONE))
                         open.decrementAndGet();
@@ -660,9 +608,6 @@ class HostConnectionPool implements Connection.Owner {
         if (isClosed())
             return;
 
-        if (!host.convictionPolicy.canReconnectNow())
-            return;
-
         // Note: this process is a bit racy, but it doesn't matter since we're still guaranteed to not create
         // more connection than maximum (and if we create more than core connection due to a race but this isn't
         // justified by the load, the connection in excess will be quickly trashed anyway)
@@ -678,7 +623,7 @@ class HostConnectionPool implements Connection.Owner {
     static class PoolState {
         volatile String keyspace;
 
-        void setKeyspace(String keyspace) {
+        public void setKeyspace(String keyspace) {
             this.keyspace = keyspace;
         }
     }

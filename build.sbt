@@ -305,8 +305,8 @@ lazy val scioCassandra2: Project = Project(
   scalaSource in Compile := (baseDirectory in ThisBuild).value / "scio-cassandra3/src/main/scala",
   scalaSource in Test := (baseDirectory in ThisBuild).value / "scio-cassandra3/src/test/scala",
   libraryDependencies ++= Seq(
-    "com.datastax.cassandra" % "cassandra-driver-core" % "2.1.10.3",
-    "org.apache.cassandra" % "cassandra-all" % "2.0.17",
+    "com.datastax.cassandra" % "cassandra-driver-core" % "2.2.0-rc3",
+    "org.apache.cassandra" % "cassandra-all" % "2.2.9" exclude ("org.slf4j", "log4j-over-slf4j"),
     "org.apache.hadoop" % "hadoop-client" % hadoopVersion
   )
 ).dependsOn(
