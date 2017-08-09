@@ -106,14 +106,16 @@ private[scio] class KryoAtomicCoder[T] extends AtomicCoder[T] {
     if (value == null) {
       throw new CoderException("cannot encode a null value")
     }
-    val os = new BufferedPrefixOutputStream(outStream)
+//    val os = new BufferedPrefixOutputStream(outStream)
+    val os = outStream
     val output = new Output(os)
     kryo.get().writeClassAndObject(output, value)
     output.flush()
-    os.finish()
+//    os.finish()
   }
 
   override def decode(inStream: InputStream): T = {
+    /*
     val o = if (VarInt.decodeInt(inStream) == -1) {
       val is = new BufferedPrefixInputStream(inStream)
       val obj = kryo.get().readClassAndObject(new Input(is))
@@ -122,6 +124,8 @@ private[scio] class KryoAtomicCoder[T] extends AtomicCoder[T] {
     } else {
       kryo.get().readClassAndObject(new Input(inStream))
     }
+    */
+    val o = kryo.get().readClassAndObject(new Input(inStream))
     o.asInstanceOf[T]
   }
 
