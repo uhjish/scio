@@ -21,7 +21,7 @@ import sbtassembly.AssemblyPlugin.autoImport._
 import com.typesafe.sbt.SbtSite.SiteKeys._
 import com.typesafe.sbt.SbtGit.GitKeys.gitRemoteRepo
 
-val beamVersion = "2.0.0"
+val beamVersion = "2.2.0-SNAPSHOT"
 
 val algebirdVersion = "0.13.0"
 val annoyVersion = "0.2.5"
@@ -79,7 +79,11 @@ val commonSettings = Sonatype.sonatypeSettings ++ assemblySettings ++ Seq(
   // protobuf-lite is an older subset of protobuf-java and causes issues
   excludeDependencies += "com.google.protobuf" % "protobuf-lite",
 
-  resolvers += Resolver.sonatypeRepo("public"),
+  updateOptions := updateOptions.value.withLatestSnapshots(false),
+  resolvers ++= Seq(
+    "Apache Snapshots" at "https://repository.apache.org/content/groups/snapshots",
+    Resolver.sonatypeRepo("public")
+  ),
 
   scalastyleSources in Compile ++= (unmanagedSourceDirectories in Test).value,
   testOptions += Tests.Argument(TestFrameworks.JUnit, "-q", "-v"),
