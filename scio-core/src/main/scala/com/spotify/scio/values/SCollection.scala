@@ -851,7 +851,7 @@ sealed trait SCollection[T] extends PCollectionWrapper[T] {
       .withNumShards(numShards)
       .withSuffix(suffix + ".avro")
       .withCodec(codec)
-      .withMetadata(metadata.asJava)
+      .withMetadata(metadata.asJava).asInstanceOf[gio.AvroIO.Write[U]]
 
   private[scio] def textOut(path: String, suffix: String, numShards: Int) =
     gio.TextIO.write()
