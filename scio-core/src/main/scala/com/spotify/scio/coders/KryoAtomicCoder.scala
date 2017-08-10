@@ -19,6 +19,7 @@ package com.spotify.scio.coders
 
 import java.io.{ByteArrayInputStream, InputStream, OutputStream}
 import java.nio.ByteBuffer
+import java.util.{Observable, Observer}
 
 import com.google.common.io.{ByteStreams, CountingOutputStream}
 import com.google.common.reflect.ClassPath
@@ -31,7 +32,7 @@ import org.apache.avro.specific.SpecificRecordBase
 import org.apache.beam.sdk.coders._
 import org.apache.beam.sdk.io.gcp.bigquery.TableRowJsonCoder
 import org.apache.beam.sdk.util.VarInt
-import org.apache.beam.sdk.util.common.ElementByteSizeObserver
+import org.apache.beam.sdk.util.common.{ElementByteSizeObservableIterable, ElementByteSizeObserver}
 import org.joda.time.{LocalDate, LocalDateTime}
 import org.slf4j.LoggerFactory
 
@@ -103,11 +104,17 @@ private[scio] class KryoAtomicCoder[T] extends AtomicCoder[T] {
     // (K, Iterable[V]) is the return type of `groupBy` or `groupByKey`. This could be very slow
     // when there're few keys with many values.
     case (key, wrapper: JIterableWrapper[_]) =>
+      // FIXME: this does not factor in length prefix
       observer.update(kryoEncodedElementByteSize(key))
-      // FIXME: handle ElementByteSizeObservableIterable[_, _]
-      val i = wrapper.underlying.iterator()
-      while (i.hasNext) {
-        observer.update(kryoEncodedElementByteSize(i.next()))
+      wrapper.underlying match {
+        case iterable: ElementByteSizeObservableIterable[_, _] =>
+          observer.setLazy()
+          iterable.addObserver(new IteratorObserver(observer))
+        case iterable: _root_.java.lang.Iterable[_] =>
+          val i = iterable.iterator()
+          while (i.hasNext) {
+            observer.update(kryoEncodedElementByteSize(i.next()))
+          }
       }
     case _ =>
       observer.update(kryoEncodedElementByteSize(value))
@@ -119,6 +126,14 @@ private[scio] class KryoAtomicCoder[T] extends AtomicCoder[T] {
     kryo.get().writeClassAndObject(output, obj)
     output.flush()
     s.getCount + VarInt.getLength(s.getCount)
+  }
+
+  // FIXME: this does not factor in length prefix
+  private class IteratorObserver(private val observer: ElementByteSizeObserver)
+    extends Observer {
+    override def update(obs: Observable, arg: Any): Unit = {
+      observer.update(obs, arg)
+    }
   }
 
 }
